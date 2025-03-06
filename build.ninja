@@ -1,0 +1,17 @@
+# CC is clang because gcc complains about not having braces around
+# initializers, idk why the two compilers are different even with the same
+# options, even with --std c99, and honeslty i can't be fucked at this point =)
+CC = clang
+FUNNYFLAGS = -fdiagnostics-color=always -fsanitize=unreachable
+CFLAGS = -DWITH_LIBUV -g -O2 -Wall -Werror $FUNNYFLAGS
+LFLAGS = -luv $FUNNYFLAGS
+
+rule cc
+    command = $CC -c $in $CFLAGS -o $out
+
+rule ld
+    command = $CC $in $LFLAGS -o $out
+
+build build/scm.o:     cc scm.c
+build build/example.o: cc example.c | memorywheel.h
+build build/example:   ld build/example.o build/scm.o
