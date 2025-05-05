@@ -26,7 +26,9 @@
 #include <sys/eventfd.h>
 
 typedef uint8_t   u8;
+typedef uint16_t  u16;
 typedef uint32_t  u32;
+typedef uint64_t  u64;
 typedef char      byte;
 typedef uint32_t  whl_offset_t;
 
@@ -49,9 +51,9 @@ typedef enum {
 typedef struct whl_slice {
 	/* the size in bytes the user requested, at least this many bytes is
 	 * reserved for this slice in the memory immediately following the slice's
-	 * address */
-	size_t               trailing_user_size;
-	/* WHL_ALIGN * aligned_size_in_wheel >= trailing_user_size */
+	 * header */
+	size_t               user_size;
+	/* WHL_ALIGN * aligned_size_in_wheel >= user_size */
 	_Atomic whl_offset_t aligned_size_in_wheel;
 	_Atomic u8           state;
 } whl_slice_t;
@@ -61,8 +63,16 @@ typedef union {
 		whl_offset_t head;
 		whl_offset_t last;
 	};
-	uint64_t         u64;
+	uint64_t u64;
 } whl_offset_pair_t;
+
+typedef union {
+	struct {
+		u8 u8a;
+		u8 u8b;
+	};
+	u16 u16;
+} whl_u8_pair_t;
 
 const whl_offset_pair_t whl_invalid_offset_pair =
 	{ .u64 = WHL_INVALID_OFFSET_PAIR };
@@ -86,11 +96,23 @@ typedef struct {
 
 /* lives in shared memory */
 typedef struct {
-	whl_spin_t   spin;
-	/* initially 0. set to 1 when a slice is shared. */
-	_Atomic u8   is_readable;
-	/* initially 1. set to 0 when making a slice fails. */
-	_Atomic u8   is_writable;
+	whl_spin_t spin;
+	union {
+		struct {
+			_Atomic u8 readable_guard;
+			/* initially 0. set to 1 when a slice is shared. */
+			_Atomic u8 is_readable;
+		};
+		_Atomic whl_u8_pair_t readable_state;
+	};
+	union {
+		struct {
+			_Atomic u8 writable_guard;
+			/* initially 1. set to 0 when making a slice fails. */
+			_Atomic u8 is_writable;
+		};
+		_Atomic whl_u8_pair_t writable_state;
+	};
 } whl_atomic_t;
 
 
@@ -120,13 +142,7 @@ typedef whl_spin_t whl_t;
 #define __whl_buf(wheel)            ((byte *)(wheel) + WHL_ALIGN)
 #define __whl_slice_buf(slice)      ((byte *)(((whl_slice_t *)(slice)) + 1))
 #define __whl_alignment_padding(sz) ((WHL_ALIGN - ((sz) % WHL_ALIGN)) % WHL_ALIGN)
-
-/* returns `size` rounded up to the nearest multiple of `WHL_ALIGN` */
-size_t
-whl_align(size_t size)
-{
-	return size + __whl_alignment_padding(size);
-}
+#define __whl_aligned(sz)           ((sz) + __whl_alignment_padding(sz))
 
 int
 __whl_efd_write(int efd, uint64_t v)
@@ -201,6 +217,7 @@ whl_atomic_init(whl_atomic_t *wheel, size_t buf_size)
 	*wheel = (whl_atomic_t) {
 		.is_readable = 0,
 		.is_writable = 1,
+		.writable_guard = WHL_INVALID_OFFSET,
 	};
 	return whl_init(&wheel->spin, buf_size);
 }
@@ -278,7 +295,7 @@ whl_efd_init(whl_efd_t *wheel, whl_atomic_t *atomic)
 	 * internally it uses a 64-bit value, the parameter to eventfd is like
 	 * 32-bits or something; very epic */
 
-	if (__whl_efd_write(writable, ~0 - 1 - atomic->is_writable) < 0) {
+	if (__whl_efd_write(writable, ~0lu - 1lu - atomic->is_writable) < 0) {
 		int no_clobber = errno;
 		close(writable);
 		close(readable);
@@ -395,20 +412,16 @@ __whl_next_offset_aligned(whl_t *wheel, whl_offset_t size,
 whl_offset_t
 whl_make_slice(whl_t *wheel, byte **bufp, size_t size)
 {
-	/* guard from overflow */
-	if (size > SIZE_MAX - sizeof(whl_slice_t))
+	size_t       size_in_wheel = __whl_aligned(sizeof(whl_slice_t) + size);
+	whl_offset_t aligned_size_in_wheel = size_in_wheel / WHL_ALIGN;
+
+	if (aligned_size_in_wheel > wheel->aligned_size)
 		return WHL_INVALID_OFFSET;
 
-	whl_offset_t  offset;
-	size_t        size_in_wheel = sizeof(whl_slice_t) + size;
-
-	size_in_wheel += __whl_alignment_padding(size_in_wheel);
-	__whl_affirm(size_in_wheel % WHL_ALIGN == 0);
-
-	whl_offset_t      aligned_size_in_wheel = size_in_wheel / WHL_ALIGN;
 	whl_offset_pair_t pair = atomic_load(&wheel->head_last);
+	whl_offset_t      offset = __whl_next_offset_aligned(wheel, aligned_size_in_wheel, pair);
 
-	if ((offset = __whl_next_offset_aligned(wheel, aligned_size_in_wheel, pair)) == WHL_INVALID_OFFSET)
+	if (offset == WHL_INVALID_OFFSET)
 		return WHL_INVALID_OFFSET;
 
 	whl_offset_t old_last = pair.last;
@@ -427,7 +440,7 @@ whl_make_slice(whl_t *wheel, byte **bufp, size_t size)
 		             wheel->aligned_size - old_last);
 
 	*__whl_at_unchecked(wheel, offset) = (whl_slice_t) {
-		.trailing_user_size = size,
+		.user_size = size,
 		.aligned_size_in_wheel = aligned_size_in_wheel,
 	};
 
@@ -477,14 +490,29 @@ whl_make_slice(whl_t *wheel, byte **bufp, size_t size)
 whl_offset_t
 whl_efd_make_slice(whl_efd_t *wheel, byte **bufp, size_t size)
 {
+	/* writable_guard is a sloppy (but correct?) way to avoid a race with
+	 * whl_efd_return_slice() where whl_make_slice() returns WHL_INVALID_OFFSET
+	 * but a slice is returned in whl_efd_return_slice() before this function
+	 * updates is_writable. Then this call clears is_writable even though a
+	 * slice was returned.
+	 * writable_guard is set by both functions to try to preempt the other's CAS */
+	atomic_store(&wheel->atomic->writable_guard, ~0);
+
 	whl_offset_t offset = whl_make_slice(&wheel->atomic->spin, bufp, size);
 
 	/* clear errno, it may be set by __whl_efd_write */
 	errno = 0;
 
-	if (   offset == WHL_INVALID_OFFSET
-	    && 1 == atomic_exchange(&wheel->atomic->is_writable, 0))
-		__whl_efd_write(wheel->writable, 1);
+	if (offset == WHL_INVALID_OFFSET) {
+		whl_u8_pair_t expect = { .u8a = ~0, .u8b = 1 };
+		whl_u8_pair_t desire = { .u8a = ~0, .u8b = 0 };
+		if (atomic_compare_exchange_strong(&wheel->atomic->writable_state,
+		                                   &expect,
+		                                   desire))
+			/* writing to the writable eventfd sets it to the maximum value,
+			 * making it non-writable */
+			__whl_efd_write(wheel->writable, 1);
+	}
 
 	return offset;
 }
@@ -505,12 +533,18 @@ whl_share_slice(whl_t *wheel, whl_offset_t offset)
 void
 whl_efd_share_slice(whl_efd_t *wheel, whl_offset_t offset)
 {
+	atomic_store(&wheel->atomic->readable_guard, 0);
+
 	whl_share_slice(&wheel->atomic->spin, offset);
 
 	/* clear errno, it may be set by __whl_efd_write */
 	errno = 0;
 
-	if (0 == atomic_exchange(&wheel->atomic->is_readable, 1))
+	whl_u8_pair_t expect = { .u8a = 0, .u8b = 0 };
+	whl_u8_pair_t desire = { .u8a = 0, .u8b = 1 };
+	if (atomic_compare_exchange_strong(&wheel->atomic->readable_state,
+	                                   &expect,
+	                                   desire))
 		__whl_efd_write(wheel->readable, 1);
 }
 
@@ -533,7 +567,7 @@ whl_next_shared_slice(whl_t *wheel, byte **bufp, size_t *size)
 		return WHL_INVALID_OFFSET;
 
 	*bufp = __whl_slice_buf(slice);
-	*size = slice->trailing_user_size;
+	*size = slice->user_size;
 	return offset;
 }
 
@@ -545,15 +579,24 @@ whl_next_shared_slice(whl_t *wheel, byte **bufp, size_t *size)
 whl_offset_t
 whl_efd_next_shared_slice(whl_efd_t *wheel, byte **bufp, size_t *size)
 {
+	atomic_store(&wheel->atomic->readable_guard, ~0);
+
 	whl_offset_t offset = whl_next_shared_slice(&wheel->atomic->spin,
 	                                            bufp, size);
 
 	/* clear errno, it may be set by __whl_efd_read */
 	errno = 0;
 
-	if (   offset == WHL_INVALID_OFFSET
-	    && 1 == atomic_exchange(&wheel->atomic->is_readable, 0))
-		__whl_efd_read(wheel->readable);
+	if (offset == WHL_INVALID_OFFSET) {
+		whl_u8_pair_t expect = { .u8a = ~0, .u8b = 1 };
+		whl_u8_pair_t desire = { .u8a = ~0, .u8b = 0 };
+		if (atomic_compare_exchange_strong(&wheel->atomic->readable_state,
+		                                   &expect,
+		                                   desire))
+			/* reading from the readable eventfd moves it to zero, making it
+			 * non-readable until a write by whl_efd_share_slice */
+			__whl_efd_read(wheel->readable);
+	}
 
 	return offset;
 }
@@ -574,12 +617,12 @@ whl_return_slice(whl_t *wheel, whl_offset_t off)
 	if (WHL_SLICE_RETURNED == atomic_exchange(&slice->state, WHL_SLICE_RETURNED))
 		return 0;
 
-    /* this is supposed to handle returns in any order, like in case you pass
-     * the offset from whl_make_slice in a different way than whl_share_slice
-     * and whl_next_shared_slice, and then return the passed offsets in a
-     * different order than they were given from whl_make_slice. mostly for
-     * multi-producer multi-consumer.
-     * but I don't think I ever tested it so idk lol =) */
+	/* this is supposed to handle returns in any order, like in case you pass
+	 * the offset from whl_make_slice in a different way than whl_share_slice
+	 * and whl_next_shared_slice, and then return the passed offsets in a
+	 * different order than they were given from whl_make_slice. mostly for
+	 * multi-producer multi-consumer.
+	 * but I don't think I ever tested it so idk lol =) */
 
 	while (   (pair = atomic_load(&wheel->head_last)).head != WHL_INVALID_OFFSET
 	       && (atomic_load(&__whl_head(wheel)->state) == WHL_SLICE_RETURNED)) {
@@ -610,15 +653,24 @@ whl_return_slice(whl_t *wheel, whl_offset_t off)
  * may try to set `whl_efd_t` `writable` to writable when polled.
  * if that fails, errno will be non-zero. */
 size_t
-whl_efd_return_slice(whl_efd_t *wheel, whl_offset_t off)
+whl_efd_return_slice(whl_efd_t *wheel, whl_offset_t offset)
 {
-	size_t r = whl_return_slice(&wheel->atomic->spin, off);
+	/* see whl_efd_make_slice() to explain the writable_guard  */
+	atomic_store(&wheel->atomic->writable_guard, 0);
+
+	size_t r = whl_return_slice(&wheel->atomic->spin, offset);
 
 	/* clear errno, it may be set by __whl_efd_read */
 	errno = 0;
 
-	if (0 == atomic_exchange(&wheel->atomic->is_writable, 1))
-		__whl_efd_read(wheel->writable);
+	if (r > 0) {
+		whl_u8_pair_t expect = { .u8a = 0, .u8b = 0 };
+		whl_u8_pair_t desire = { .u8a = 0, .u8b = 1 };
+		if (atomic_compare_exchange_strong(&wheel->atomic->writable_state,
+		                                   &expect,
+		                                   desire))
+			__whl_efd_read(wheel->writable);
+	}
 
 	return r;
 }

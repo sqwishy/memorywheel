@@ -8,6 +8,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #if WITH_LIBUV
@@ -17,12 +18,16 @@
 #include "scm.h"
 #include "memorywheel.h"
 
-#define WHEEL_SIZE     ((uint64_t) 64 /* mb */ * 1024 * 1024)
 /* the sock tests are also limited by the socket buffer
  * because of SOCK_SEQPACKET (sysctl net.core.wmem_max) */
-#define SEND_SIZE_MAX  ((uint64_t)                128 * 1024)
+#define WHEEL_SIZE     ((uint64_t) 128 * 1024)
+#define SEND_SIZE_MAX  ((uint64_t)         16)
 #define MAGIC          ("¯\\_(ツ)_/¯")
-#define NLOOPS         (1000 * 1000)
+#define NLOOPS         (1000 * 1000 * 1)
+
+#define NANOS_PER_SEC 1000000000
+
+typedef struct timespec timespec_t;
 
 typedef struct err {
 	uint16_t  line;
@@ -35,6 +40,7 @@ typedef struct err {
 #define YIPPIE        (err_t) { 0 }
 #define iserr(e)      (e).msg != 0
 #define eprintln(fmt, ...)  fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+#define println(fmt, ...)   fprintf(stdout, fmt "\n", ##__VA_ARGS__)
 #define ERRFMT              "%s:%i (%i) %s"
 
 #if WITH_LIBUV
@@ -59,7 +65,8 @@ typedef struct xorshiftr128plus_state {
 	uint64_t s[2]; // seeds
 } xorshiftr128plus_t;
 
-uint64_t xorshiftr128plus(struct xorshiftr128plus_state *state)
+uint64_t
+xorshiftr128plus(xorshiftr128plus_t *state)
 {
 	uint64_t x = state->s[0];
 	uint64_t const y = state->s[1];
@@ -220,9 +227,8 @@ do_uv_read(uv_poll_t *handle, int status, int events)
 	char          *buf;
 	whl_offset_t   offset = whl_efd_next_shared_slice(r->whl_efd, &buf, &bufsize);
 
-	if (offset == WHL_INVALID_OFFSET) {
+	if (offset == WHL_INVALID_OFFSET)
 		return;
-	}
 
 	if (!test_buf(buf, bufsize))
 		eprintln("% 6i %x failed cmp", r->loops, offset);
@@ -548,8 +554,12 @@ _main_receiver_seqpacket(int sockfd, size_t *total)
 err_t
 main_receiver(int sockfd, tport_t tport)
 {
-	err_t  e;
-	size_t total = 0;
+	err_t      e;
+	size_t     total = 0;
+	timespec_t before, after;
+	double     elapsed;
+
+	clock_gettime(CLOCK_MONOTONIC, &before);
 
 	if (tport == TPORT_LIBUV)
 		e = _main_receiver_libuv(sockfd, &total);
@@ -559,6 +569,12 @@ main_receiver(int sockfd, tport_t tport)
 		e = _main_receiver_seqpacket(sockfd, &total);
 	else
 		return thiserr(EINVAL, "unexpected transport");
+
+	clock_gettime(CLOCK_MONOTONIC, &after);
+
+	elapsed = (double)(after.tv_sec - before.tv_sec)
+	        + (double)(after.tv_nsec - before.tv_nsec) / (double)NANOS_PER_SEC;
+	println("%f", elapsed);
 
 	eprintln("rx done %.3fmb", (float)total / 1024. / 1024.);
 
@@ -620,7 +636,28 @@ _forking_main(char *exe, char *mode)
 	return YIPPIE;
 }
 
-tport_t tport_from_str(char *s)
+/*
+uint64_t
+u64_from_str(char *s)
+{
+	uint64_t v;
+	char     unit;
+
+	if (sscanf(s, "%lu%c", &v, &unit) < 0)
+		return ~0;
+
+	switch (unit) {
+		case 'g': case 'G': v *= 1024;
+		case 'm': case 'M': v *= 1024;
+		case 'k': case 'K': v *= 1024;
+	}
+
+	return v;
+}
+*/
+
+tport_t
+tport_from_str(char *s)
 {
 	if (strcmp(s, "uv") == 0)
 		return TPORT_LIBUV;
@@ -658,7 +695,7 @@ main(int argc, char *argv[])
 			}
 		default:
 		usage:
-			eprintln("usage: %s [<uv|spin|seqpacket> [<rx|rx> <fd>]]", argv[0]);
+			eprintln("usage: %s [<uv|spin|seqpacket> [<rx|tx> <fd>]]", argv[0]);
 			return 1;
 	}
 
